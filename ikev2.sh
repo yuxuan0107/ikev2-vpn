@@ -115,7 +115,9 @@ distro_label() {
 # 容器内缺少内核 XFRM 模块与 NET_ADMIN 能力，IPsec 无法真正工作
 check_not_container() {
   local virt=""
-  command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || true)"
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt="$(systemd-detect-virt 2>/dev/null || true)"
+  fi
   if [[ -n "${virt}" && "${virt}" != "none" ]]; then
     die "检测到容器环境（${virt}）。IPsec 依赖内核 XFRM 模块与 NET_ADMIN 能力，容器内无法正常工作。请在宿主机或云主机上部署。"
   fi
@@ -159,18 +161,19 @@ pkg_has() {
 # RHEL 系：strongSwan 不在官方源，需先引导 EPEL
 ensure_epel() {
   [[ "${NEED_EPEL}" == "yes" ]] || return 0
-  rpm -q epel-release >/dev/null 2>&1 && return 0
+  # 已安装直接返回（用 if 而非 cmd && return，避免 set -e 下未安装时终止）
+  if rpm -q epel-release >/dev/null 2>&1; then return 0; fi
   info "引导 EPEL 仓库（strongSwan 不在 RHEL 官方源中）..."
   local ok=0 maj
   maj="$(rpm -E %rhel 2>/dev/null | awk -F. '{print $1}')"
-  pkg_install epel-release >/dev/null 2>&1 && ok=1
+  pkg_install epel-release >/dev/null 2>&1 && ok=1 || true
   if [[ ${ok} -eq 0 ]]; then
     dnf config-manager --set-enabled crb powertools >/dev/null 2>&1 || true
-    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj:-9}.noarch.rpm" >/dev/null 2>&1 && ok=1
+    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj:-9}.noarch.rpm" >/dev/null 2>&1 && ok=1 || true
   fi
   if [[ ${ok} -eq 0 ]] && command -v subscription-manager >/dev/null 2>&1 && [[ -n "${maj}" ]]; then
     subscription-manager repos --enable "codeready-builder-for-rhel-${maj}-$(uname -m)-rpms" >/dev/null 2>&1 || true
-    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj}.noarch.rpm" >/dev/null 2>&1 && ok=1
+    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj}.noarch.rpm" >/dev/null 2>&1 && ok=1 || true
   fi
   [[ ${ok} -eq 1 ]] || die "EPEL 仓库引导失败。RHEL 系安装 strongSwan 必须先有 EPEL，请手动执行：
   dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-\$(rpm -E %rhel | awk -F. '{print \$1}').noarch.rpm"
@@ -195,7 +198,7 @@ ensure_alpine_repo() {
 
 # 探测公网 IP 依赖 curl，最小化安装的系统可能没有
 ensure_tools() {
-  command -v curl >/dev/null 2>&1 && return 0
+  if command -v curl >/dev/null 2>&1; then return 0; fi
   info "安装 curl（用于探测公网 IP）..."
   pkg_install curl >/dev/null 2>&1 || warn "curl 安装失败，公网 IP 探测会回退到本机网卡地址（NAT 场景不准，请手动填）"
 }
@@ -334,6 +337,8 @@ ask_secret() {
       esac
       break
     done
+  else
+    warn "非交互模式下无法设置密码，请稍后运行 bash $0 useradd <用户名> <密码>"
   fi
   printf -v "${__var}" '%s' "${__a}"
 }
@@ -446,6 +451,7 @@ EOF
 }
 
 load_state() {
+  detect_distro   # 各子命令依赖 CONF_DIR，必须先行识别发行版
   [[ -r "${STATE_FILE}" ]] || die "尚未安装（缺 ${STATE_FILE}），先运行: bash $0 install"
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
@@ -746,14 +752,15 @@ EOF
 }
 
 # 先查后加，重复执行不会堆积规则
+# 用 if 而非 `cmd && return`，否则 set -e 下首次加规则（-C 查不到）会直接终止脚本
 ipt() {
   local t="$1" c="$2"; shift 2
-  iptables -t "$t" -C "$c" "$@" 2>/dev/null && return 0
+  if iptables -t "$t" -C "$c" "$@" 2>/dev/null; then return 0; fi
   iptables -t "$t" -A "$c" "$@" 2>/dev/null || warn "规则添加失败(iptables -t $t -A $c $*)"
 }
 ip6t() {
   local t="$1" c="$2"; shift 2
-  ip6tables -t "$t" -C "$c" "$@" 2>/dev/null && return 0
+  if ip6tables -t "$t" -C "$c" "$@" 2>/dev/null; then return 0; fi
   ip6tables -t "$t" -A "$c" "$@" 2>/dev/null || warn "规则添加失败(ip6tables -t $t -A $c $*)"
 }
 
@@ -828,7 +835,9 @@ cmd_selftest() {
   # 1 容器检测
   echo "── 1. 运行环境 ────────────────────"
   local virt="" in_cgroup="no"
-  command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || true)"
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt="$(systemd-detect-virt 2>/dev/null || true)"
+  fi
   if [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
     in_cgroup="yes"
   fi
@@ -1007,8 +1016,8 @@ cmd_install() {
   if [[ "${MODE}" == "eap" ]]; then
     rm -f "${PSK_FILE}"     # 切到 EAP 后别留着旧 PSK 密钥文件误导排查
   else
-    # 已存在 PSK 时不重新生成：重跑 install 不该让手机上填的密钥失效
-    if [[ -f "${PSK_FILE}" && -n "${PSK_VALUE}" ]]; then
+    # 已有 PSK 文件即沿用，无论是否曾自动生成：重跑 install 不该让手机上填的密钥失效
+    if [[ -f "${PSK_FILE}" ]]; then
       psk="$(awk -F'secret = ' '/secret = /{print $2; exit}' "${PSK_FILE}")"
       info "沿用已有的 PSK 密钥（重跑 install 不会让手机上的旧密钥失效）"
     else
@@ -1233,6 +1242,7 @@ cmd_diag() {
 
 cmd_uninstall() {
   need_root uninstall
+  detect_distro   # uninstall 也要 CONF_DIR 才能删对文件
   # 未安装时也要能继续清理，不能用 load_state（内部 die 会直接 exit，|| true 拦不住）
   if [[ -r "${STATE_FILE}" ]]; then
     # shellcheck disable=SC1090

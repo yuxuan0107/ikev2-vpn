@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# IKEv2/IPsec VPN 服务端一键部署脚本 (Debian)
+# IKEv2/IPsec VPN 服务端一键部署脚本（Linux 通用）
 # 双模: IKEv2/IPsec PSK + IKEv2 EAP-MSCHAPv2，支持 IPv4/IPv6 双栈全流量隧道
-# 用法: bash ikev2.sh install | client | status | useradd | userdel | users | rotate-psk | uninstall
+# 用法: bash ikev2.sh install | selftest | client | status | diag | mode | useradd | userdel | users | rotate-psk | uninstall
 set -euo pipefail
 
 # ==================== 变量区（按需修改，留空则自动探测） ====================
@@ -28,10 +28,18 @@ INSTALL_AUTO="${INSTALL_AUTO:-no}"   # yes 时全程用默认值，不提问（�
 FIRST_USER=""                        # 交互模式下填写的首个 EAP 用户
 FIRST_PASS=""
 
-CONF_DIR="/etc/swanctl"
-CONF_FILE="${CONF_DIR}/conf.d/ikev2-vpn.conf"
-PSK_FILE="${CONF_DIR}/conf.d/ikev2-psk.conf"
-EAP_FILE="${CONF_DIR}/conf.d/ikev2-eap.conf"
+CONF_DIR=""
+CONF_FILE=""
+PSK_FILE=""
+EAP_FILE=""
+# 发行版相关信息，由 detect_distro() 填充。手动指定可跳过自动识别。
+DISTRO=""                  # debian | rhel | arch | opensuse | alpine
+PKG_MGR=""                 # apt | dnf | pacman | zypper | apk
+SERVICE_NAME=""            # 服务名，通常为 strongswan
+INIT_KIND=""               # systemd | openrc
+FIREWALL_KIND=""           # iptables | firewalld
+NEED_EPEL="no"             # rhel 系是否需要引导 EPEL
+CA_EXPORT="/root/ikev2-ca.crt"
 USER_LIST="/etc/ikev2-vpn/users.list"
 STATE_FILE="/etc/ikev2-vpn/env"
 LOG="[ikev2]"
@@ -41,16 +49,155 @@ info() { echo "${LOG} $*"; }
 warn() { echo "${LOG} 警告: $*"; }
 need_root() { [[ $EUID -eq 0 ]] || die "请用 root 运行: sudo bash $0 $*"; }
 
-# 探测公网 IP 依赖 curl，最小化安装的 Debian 可能没有，需在探测前补上
-ensure_tools() {
-  if ! command -v curl >/dev/null 2>&1; then
-    info "安装 curl（用于探测公网 IP）..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1 || true
-    if ! apt-get install -y -qq curl >/dev/null 2>&1; then
-      warn "curl 安装失败，公网 IP 探测会回退到本机网卡地址（NAT 场景不准，请手动填）"
-    fi
+# ==================== 发行版识别 ====================
+# 依据 /etc/os-release 的 ID 与 ID_LIKE 字段，填充全局变量
+detect_distro() {
+  if [[ -n "${DISTRO}" ]]; then
+    apply_distro_defaults
+    return 0
   fi
+  if [[ ! -r /etc/os-release ]]; then
+    die "读不到 /etc/os-release，无法识别发行版。可在脚本头部手动设置 DISTRO=debian"
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local id="${ID:-}" like="${ID_LIKE:-}"
+  case " ${id} ${like} " in
+    *" debian "*|*" ubuntu "*)                      DISTRO="debian" ;;
+    *" rhel "*|*" fedora "*|*" centos "*)            DISTRO="rhel" ;;
+    *" arch "*|*" manjaro "*|*" endeavouros "*)      DISTRO="arch" ;;
+    *" opensuse "*|*" suse "*|*" sle "*|*" sles "*) DISTRO="opensuse" ;;
+    *" alpine "*)                                   DISTRO="alpine" ;;
+    *) die "未识别的发行版: ID=${id:-空} ID_LIKE=${like:-空}。
+       当前支持 debian、rhel、arch、opensuse、alpine 五类。
+       可在脚本头部手动设置 DISTRO=debian 强制指定。" ;;
+  esac
+  apply_distro_defaults
+}
+
+apply_distro_defaults() {
+  case "${DISTRO}" in
+    debian)
+      PKG_MGR="apt"; SERVICE_NAME="strongswan"; INIT_KIND="systemd"
+      FIREWALL_KIND="iptables"; NEED_EPEL="no"; CONF_DIR="/etc/swanctl" ;;
+    rhel)
+      PKG_MGR="dnf"; SERVICE_NAME="strongswan"; INIT_KIND="systemd"
+      FIREWALL_KIND="firewalld"; NEED_EPEL="yes"
+      # RHEL 系把 swanctl 配置放在 strongswan 子目录下，与其他发行版不同
+      CONF_DIR="/etc/strongswan/swanctl" ;;
+    arch)
+      PKG_MGR="pacman"; SERVICE_NAME="strongswan"; INIT_KIND="systemd"
+      FIREWALL_KIND="iptables"; NEED_EPEL="no"; CONF_DIR="/etc/swanctl" ;;
+    opensuse)
+      PKG_MGR="zypper"; SERVICE_NAME="strongswan"; INIT_KIND="systemd"
+      FIREWALL_KIND="iptables"; NEED_EPEL="no"; CONF_DIR="/etc/swanctl" ;;
+    alpine)
+      PKG_MGR="apk"; SERVICE_NAME="strongswan"; INIT_KIND="openrc"
+      FIREWALL_KIND="iptables"; NEED_EPEL="no"; CONF_DIR="/etc/swanctl" ;;
+    *) die "DISTRO 取值非法: ${DISTRO}（可选 debian rhel arch opensuse alpine）" ;;
+  esac
+  CONF_FILE="${CONF_DIR}/conf.d/ikev2-vpn.conf"
+  PSK_FILE="${CONF_DIR}/conf.d/ikev2-psk.conf"
+  EAP_FILE="${CONF_DIR}/conf.d/ikev2-eap.conf"
+}
+
+distro_label() {
+  case "${DISTRO}" in
+    debian)   echo "Debian / Ubuntu 系" ;;
+    rhel)     echo "RHEL / CentOS / Rocky / Alma / Fedora 系" ;;
+    arch)     echo "Arch 系" ;;
+    opensuse) echo "openSUSE 系" ;;
+    alpine)   echo "Alpine" ;;
+    *)        echo "未知" ;;
+  esac
+}
+
+# 容器内缺少内核 XFRM 模块与 NET_ADMIN 能力，IPsec 无法真正工作
+check_not_container() {
+  local virt=""
+  command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || true)"
+  if [[ -n "${virt}" && "${virt}" != "none" ]]; then
+    die "检测到容器环境（${virt}）。IPsec 依赖内核 XFRM 模块与 NET_ADMIN 能力，容器内无法正常工作。请在宿主机或云主机上部署。"
+  fi
+  if [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
+    die "检测到容器环境。IPsec 依赖内核 XFRM 模块，容器内无法正常工作。请在宿主机或云主机上部署。"
+  fi
+}
+
+# ==================== 包管理 ====================
+# 业务代码只调用 pkg_install / pkg_refresh / pkg_has，不直接碰各发行版的包管理器
+pkg_refresh() {
+  case "${PKG_MGR}" in
+    apt)    apt-get update -qq ;;
+    dnf)    dnf makecache -q ;;
+    pacman) pacman -Sy --noconfirm ;;
+    zypper) zypper --quiet --non-interactive refresh ;;
+    apk)    apk update -q ;;
+  esac
+}
+
+pkg_install() {
+  case "${PKG_MGR}" in
+    apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+    dnf)    dnf install -y -q "$@" ;;
+    pacman) pacman -S --needed --noconfirm "$@" ;;
+    zypper) zypper --non-interactive install -y "$@" ;;
+    apk)    apk add --no-cache "$@" ;;
+  esac
+}
+
+pkg_has() {
+  case "${PKG_MGR}" in
+    apt)    dpkg -s "$1" >/dev/null 2>&1 ;;
+    dnf)    rpm -q "$1" >/dev/null 2>&1 ;;
+    pacman) pacman -Qi "$1" >/dev/null 2>&1 ;;
+    zypper) rpm -q "$1" >/dev/null 2>&1 ;;
+    apk)    apk info -e "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+# RHEL 系：strongSwan 不在官方源，需先引导 EPEL
+ensure_epel() {
+  [[ "${NEED_EPEL}" == "yes" ]] || return 0
+  rpm -q epel-release >/dev/null 2>&1 && return 0
+  info "引导 EPEL 仓库（strongSwan 不在 RHEL 官方源中）..."
+  local ok=0 maj
+  maj="$(rpm -E %rhel 2>/dev/null | awk -F. '{print $1}')"
+  pkg_install epel-release >/dev/null 2>&1 && ok=1
+  if [[ ${ok} -eq 0 ]]; then
+    dnf config-manager --set-enabled crb powertools >/dev/null 2>&1 || true
+    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj:-9}.noarch.rpm" >/dev/null 2>&1 && ok=1
+  fi
+  if [[ ${ok} -eq 0 ]] && command -v subscription-manager >/dev/null 2>&1 && [[ -n "${maj}" ]]; then
+    subscription-manager repos --enable "codeready-builder-for-rhel-${maj}-$(uname -m)-rpms" >/dev/null 2>&1 || true
+    pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${maj}.noarch.rpm" >/dev/null 2>&1 && ok=1
+  fi
+  [[ ${ok} -eq 1 ]] || die "EPEL 仓库引导失败。RHEL 系安装 strongSwan 必须先有 EPEL，请手动执行：
+  dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-\$(rpm -E %rhel | awk -F. '{print \$1}').noarch.rpm"
+  info "EPEL 仓库已就绪"
+}
+
+# Alpine：strongSwan 位于 community 仓库
+ensure_alpine_repo() {
+  [[ "${DISTRO}" == "alpine" ]] || return 0
+  local repos="/etc/apk/repositories" ver
+  if apk policy strongswan 2>/dev/null | grep -q 'community'; then
+    return 0
+  fi
+  ver="$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)"
+  # 只在末尾追加一行 community，不能改写已有行（sed 的 a\ 追加）
+  if [[ -n "${ver}" ]] && ! grep -q 'community' "${repos}" 2>/dev/null; then
+    warn "strongSwan 位于 community 仓库，正在为 ${repos} 追加该条目"
+    printf 'https://dl-cdn.alpinelinux.org/alpine/v%s/community\n' "${ver}" >>"${repos}"
+  fi
+  apk update -q >/dev/null 2>&1 || true
+}
+
+# 探测公网 IP 依赖 curl，最小化安装的系统可能没有
+ensure_tools() {
+  command -v curl >/dev/null 2>&1 && return 0
+  info "安装 curl（用于探测公网 IP）..."
+  pkg_install curl >/dev/null 2>&1 || warn "curl 安装失败，公网 IP 探测会回退到本机网卡地址（NAT 场景不准，请手动填）"
 }
 
 # ---------------------------- 环境探测 ----------------------------
@@ -101,7 +248,6 @@ probe_env() {
 }
 
 detect_env() {
-  grep -qiE 'debian|ubuntu' /etc/os-release 2>/dev/null || die "只支持 Debian/Ubuntu 系"
   probe_env
   if [[ -z "${VPN_IF}" ]]; then VPN_IF="${PROBE_IF}"; fi
   [[ -n "${VPN_IF}" ]] || die "探测不到默认出口网卡，请手动设置 VPN_IF"
@@ -309,15 +455,81 @@ load_state() {
 }
 
 install_packages() {
-  info "安装 strongSwan ..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq strongswan strongswan-swanctl strongswan-pki \
-    libcharon-extra-plugins curl iproute2 >/dev/null
-  apt-get install -y -qq iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
+  info "安装 strongSwan（$(distro_label)）..."
+  ensure_epel
+  ensure_alpine_repo
+  pkg_refresh >/dev/null 2>&1 || true
+  # 各发行版的包名不同，swanctl 与 pki 工具随主包附带
+  pkg_install strongswan curl iproute2 || die "strongSwan 安装失败，请检查网络与软件源配置"
+  # Debian/Ubuntu 需额外装 pki 工具包
+  if [[ "${DISTRO}" == "debian" ]]; then
+    pkg_install strongswan-swanctl strongswan-pki >/dev/null 2>&1 || true
+  fi
+  # 防火墙持久化相关（缺失不影响主流程）
+  case "${DISTRO}" in
+    debian) pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || true ;;
+    rhel)   pkg_install iptables-services >/dev/null 2>&1 || true ;;
+    alpine) pkg_install iptables >/dev/null 2>&1 || true ;;
+  esac
+  svc_disable_legacy
+  svc_enable
+  command -v swanctl >/dev/null 2>&1 || die "swanctl 未安装成功，${CONF_DIR} 不可用"
+}
+
+# ==================== 服务管理 ====================
+# systemd 与 OpenRC 双路径
+svc_enable() {
+  if [[ "${INIT_KIND}" == "openrc" ]]; then
+    rc-update add "${SERVICE_NAME}" default >/dev/null 2>&1 || true
+    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || true
+  else
+    systemctl enable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
+}
+
+svc_restart() {
+  if [[ "${INIT_KIND}" == "openrc" ]]; then
+    rc-service "${SERVICE_NAME}" restart >/dev/null 2>&1 || true
+  else
+    systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
+}
+
+svc_stop() {
+  if [[ "${INIT_KIND}" == "openrc" ]]; then
+    rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+  else
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
+}
+
+svc_is_active() {
+  if [[ "${INIT_KIND}" == "openrc" ]]; then
+    rc-service "${SERVICE_NAME}" status >/dev/null 2>&1 && echo active || echo inactive
+  else
+    systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo inactive
+  fi
+}
+
+# Debian 的 strongswan 元包会带入 legacy starter，与 charon-systemd 冲突
+# （官方文档明确要求二者只留其一）
+svc_disable_legacy() {
+  if [[ "${INIT_KIND}" == "openrc" ]]; then return 0; fi
+  systemctl list-unit-files 2>/dev/null | grep -q '^strongswan-starter' || return 0
+  info "停用 legacy strongswan-starter（与 charon-systemd 冲突）"
   systemctl disable --now strongswan-starter >/dev/null 2>&1 || true
-  systemctl enable --now strongswan >/dev/null 2>&1 || true
-  command -v swanctl >/dev/null || die "swanctl 未安装成功"
+}
+
+# 日志查看：systemd 用 journalctl，OpenRC 无处可用则回落到 rc-service 日志
+show_logs() {
+  local lines="$1"
+  if [[ "${INIT_KIND}" == "openrc" ]]; then
+    if command -v logread >/dev/null 2>&1; then
+      logread 2>/dev/null | tail -n "${lines}" | sed 's/^/  /' || true
+    fi
+    return 0
+  fi
+  journalctl -u "${SERVICE_NAME}" --since '10 min ago' --no-pager -n "${lines}" 2>/dev/null | sed 's/^/  /' || true
 }
 
 ensure_include() {
@@ -347,8 +559,8 @@ gen_pki() {
         --dn "CN=${VPN_HOST}" --san "${VPN_HOST}" --flag serverAuth --flag ikeIntermediate \
         --lifetime 825 --outform pem >"${CONF_DIR}/x509/server.crt"
   chmod 600 "${CONF_DIR}/private/ca.key" "${CONF_DIR}/private/server.key"
-  install -m 644 "${CONF_DIR}/x509ca/ca.crt" /root/ikev2-ca.crt
-  info "CA 证书已导出到 /root/ikev2-ca.crt"
+  install -m 644 "${CONF_DIR}/x509ca/ca.crt" "${CA_EXPORT}"
+  info "CA 证书已导出到 ${CA_EXPORT}"
 }
 
 gen_psk() {
@@ -546,7 +758,15 @@ ip6t() {
 }
 
 apply_firewall() {
-  info "配置防火墙 / NAT / MSS ..."
+  info "配置防火墙 / NAT / MSS（后端：${FIREWALL_KIND}）..."
+  # firewalld 存在时优先用它放通，RHEL 系默认只放行 ssh
+  if [[ "${FIREWALL_KIND}" == "firewalld" ]] && command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-service=ipsec >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=500/udp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=4500/udp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || warn "firewalld reload 失败，请手动执行 firewall-cmd --reload"
+    info "firewalld 已放行 ipsec 服务与 UDP 500/4500"
+  fi
   ipt filter INPUT  -p udp --dport 500  -j ACCEPT
   ipt filter INPUT  -p udp --dport 4500 -j ACCEPT
   ipt filter INPUT  -p esp -j ACCEPT
@@ -566,10 +786,195 @@ apply_firewall() {
     ip6t mangle FORWARD -s "${POOL6}" -o "${VPN_IF}" -p tcp --tcp-flags SYN,RST SYN \
         -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1340
   fi
-  netfilter-persistent save >/dev/null 2>&1 || true
+  persist_firewall
+}
+
+# 各发行版的规则持久化方式不同
+persist_firewall() {
+  case "${DISTRO}" in
+    debian)
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+      else
+        warn "未装 netfilter-persistent，重启后防火墙规则会丢失。可执行：apt install iptables-persistent"
+      fi ;;
+    rhel)
+      if systemctl list-unit-files 2>/dev/null | grep -q '^iptables.service'; then
+        systemctl enable iptables >/dev/null 2>&1 || true
+        iptables-save >/etc/sysconfig/iptables 2>/dev/null || true
+        ip6tables-save >/etc/sysconfig/ip6tables 2>/dev/null || true
+      fi ;;
+    alpine)
+      # Alpine 用 /etc/iptables/rules.v4 持久化
+      if command -v iptables-save >/dev/null 2>&1; then
+        mkdir -p /etc/iptables
+        iptables-save  >/etc/iptables/rules.v4  2>/dev/null || true
+        ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+      fi ;;
+    *) : ;;  # Arch/openSUSE 的 iptables 服务由用户自行管理
+  esac
 }
 
 reload() { swanctl --load-all --noprompt >/dev/null 2>&1 || swanctl --load-all; }
+
+# ==================== 环境自检 ====================
+# 只读检查，不做任何修改。用于在目标机器上验证发行版识别是否正确
+cmd_selftest() {
+  echo "════════════════════════════════════════════════"
+  echo " ikev2.sh 环境自检（只读，不会修改系统）"
+  echo "════════════════════════════════════════════════"
+  echo
+
+  # 1 容器检测
+  echo "── 1. 运行环境 ────────────────────"
+  local virt="" in_cgroup="no"
+  command -v systemd-detect-virt >/dev/null 2>&1 && virt="$(systemd-detect-virt 2>/dev/null || true)"
+  if [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
+    in_cgroup="yes"
+  fi
+  echo "  虚拟化类型 : ${virt:-none}"
+  echo "  容器迹象   : ${in_cgroup}  (yes 表示 install 会被拒绝)"
+  echo "  内核版本   : $(uname -r)"
+  echo "  架构       : $(uname -m)"
+  echo
+
+  # 2 发行版识别
+  echo "── 2. 发行版识别 ──────────────────"
+  if ! detect_distro 2>/tmp/ikev2-distro-err; then
+    echo "  识别失败: $(tr '\n' ' ' </tmp/ikev2-distro-err)"
+    rm -f /tmp/ikev2-distro-err
+    echo
+    echo "  可在脚本头部手动设置 DISTRO=debian 强制指定后重试"
+    return 1
+  fi
+  rm -f /tmp/ikev2-distro-err
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "  /etc/os-release : ID=${ID:-空}  ID_LIKE=${ID_LIKE:-空}  VERSION_ID=${VERSION_ID:-空}"
+  fi
+  echo "  识别结果       : ${DISTRO}  ($(distro_label))"
+  echo "  包管理器       : ${PKG_MGR}  $(command -v "${PKG_MGR}" >/dev/null 2>&1 && echo '已安装' || echo '未找到')"
+  echo "  配置目录       : ${CONF_DIR}  $([[ -d ${CONF_DIR} ]] && echo '已存在' || echo '尚不存在，安装时会创建')"
+  echo "  服务名         : ${SERVICE_NAME}"
+  echo "  init 系统      : ${INIT_KIND}"
+  echo "  防火墙后端     : ${FIREWALL_KIND}"
+  echo "  需引导 EPEL    : ${NEED_EPEL}"
+  echo "  CA 导出路径    : ${CA_EXPORT}"
+  echo
+
+  # 3 内核能力
+  echo "── 3. 内核 IPsec 能力 ──────────────"
+  local m
+  for m in esp4 esp6 xfrm_user af_key; do
+    if lsmod 2>/dev/null | grep -q "^${m}\b" || [[ -d "/sys/module/${m}" ]]; then
+      echo "  ${m}: 已加载"
+    else
+      echo "  ${m}: 未加载（IPsec 会按需自动加载，不影响）"
+    fi
+  done
+  echo "  net.ipv4.ip_forward = $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo '读不到')  (安装时会置 1)"
+  echo "  IPv6 默认路由     : $(ip -6 route show default 2>/dev/null | head -1 || echo '无（脚本会自动关闭 IPv6 隧道）')"
+  echo "  IPv4 默认出口网卡 : $(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}' || echo '探测不到')"
+  echo
+
+  # 4 依赖检查
+  echo "── 4. 依赖与工具 ───────────────────"
+  local c
+  for c in swanctl pki openssl iptables ip sysctl ss; do
+    if command -v "${c}" >/dev/null 2>&1; then
+      printf "  %-12s 已安装  %s\n" "${c}" "$(command -v "${c}")"
+    else
+      printf "  %-12s 缺失    %s\n" "${c}" "$(pkg_install_hint "${c}")"
+    fi
+  done
+  for c in ip6tables tcpdump; do
+    command -v "${c}" >/dev/null 2>&1 \
+      && printf "  %-12s 已安装\n" "${c}" \
+      || printf "  %-12s 缺失（可选）\n" "${c}"
+  done
+  echo
+
+  # 5 软件源可用性
+  echo "── 5. 软件源 ───────────────────────"
+  case "${DISTRO}" in
+    rhel)
+      if rpm -q epel-release >/dev/null 2>&1; then
+        echo "  EPEL 仓库: 已安装"
+      else
+        echo "  EPEL 仓库: 未安装，install 会自动引导（需能访问 dl.fedoraproject.org）"
+      fi
+      if command -v firewall-cmd >/dev/null 2>&1; then
+        echo "  firewalld : 已安装，install 会自动放行 ipsec 服务"
+      else
+        echo "  firewalld : 未安装，仅用 iptables"
+      fi ;;
+    alpine)
+      if apk policy strongswan 2>/dev/null | grep -q 'community'; then
+        echo "  strongSwan: community 仓库中可见"
+      else
+        echo "  strongSwan: 当前源中不可见，install 会自动追加 community 仓库"
+      fi ;;
+    debian)
+      if apt-cache policy strongswan 2>/dev/null | grep -q 'Candidate: [^(]'; then
+        echo "  strongSwan: 源中可见"
+      else
+        echo "  strongSwan: 当前源中不可见，请检查 apt 源配置"
+      fi ;;
+    *)
+      echo "  包管理器可直接安装 strongSwan" ;;
+  esac
+  echo
+
+  # 6 端口占用
+  echo "── 6. 端口占用 ─────────────────────"
+  local busy
+  busy="$(ss -lunp 2>/dev/null | grep -E ':(500|4500)\b' || true)"
+  if [[ -n "${busy}" ]]; then
+    echo "  500/4500 已被占用，安装时会复用现有 strongSwan 进程："
+    printf '%s\n' "${busy}" | head -4 | sed 's/^/    /'
+  else
+    echo "  500/4500 空闲"
+  fi
+  echo
+
+  # 7 现有安装状态
+  echo "── 7. 已有配置 ─────────────────────"
+  if [[ -r "${STATE_FILE}" ]]; then
+    echo "  已安装过，状态文件 ${STATE_FILE}"
+    # shellcheck disable=SC1090
+    ( source "${STATE_FILE}" 2>/dev/null && echo "  当前模式=${MODE:-?}  服务器地址=${VPN_HOST:-?}  地址池=${POOL4:-?}" ) || true
+    if [[ "${INIT_KIND}" == "systemd" ]]; then
+      echo "  服务状态: $(svc_is_active)"
+    else
+      echo "  服务状态: $(rc-service "${SERVICE_NAME}" status >/dev/null 2>&1 && echo active || echo inactive)"
+    fi
+  else
+    echo "  尚未安装（无 ${STATE_FILE}）"
+  fi
+  echo
+  echo "════════════════════════════════════════════════"
+  if [[ "${in_cgroup}" == "yes" ]]; then
+    echo " 结论: 处于容器环境，install 会被拒绝。IPsec 需宿主机。"
+  else
+    echo " 结论: 可以执行 bash $0 install"
+  fi
+  echo "════════════════════════════════════════════════"
+}
+
+# 缺失命令的安装提示，按包管理器给出对应命令
+pkg_install_hint() {
+  case "$1" in
+    swanctl)  echo "随 strongswan 包安装" ;;
+    pki)      echo "Debian 系需装 strongswan-pki，其余随主包" ;;
+    openssl)  echo "apt/dnf/pacman/zypper/apk install openssl" ;;
+    iptables) case "${DISTRO}" in debian) echo "apt install iptables";; rhel) echo "dnf install iptables";; arch) echo "pacman -S iptables";; opensuse) echo "zypper install iptables";; alpine) echo "apk add iptables";; esac ;;
+    ip)       echo "iproute2 包（apt install iproute2）" ;;
+    sysctl)   echo "procps 包（apt install procps）" ;;
+    ss)       echo "iproute2 包（apt install iproute2）" ;;
+    *)        echo "" ;;
+  esac
+}
 
 cmd_install() {
   need_root install
@@ -580,7 +985,9 @@ cmd_install() {
       *) die "未知参数 ${arg}（install 仅支持 --auto）" ;;
     esac
   done
-  grep -qiE 'debian|ubuntu' /etc/os-release 2>/dev/null || die "只支持 Debian/Ubuntu 系"
+  check_not_container
+  detect_distro
+  info "识别到发行版：$(distro_label)（包管理器 ${PKG_MGR}，配置目录 ${CONF_DIR}）"
   ensure_tools
   probe_env
   if [[ "${INSTALL_AUTO}" != "yes" ]]; then interactive_setup; fi
@@ -659,7 +1066,7 @@ cmd_client() {
     else
       echo "  可用账号         : 还没有，先跑 bash $0 useradd 名字 密码"
     fi
-    echo "  IPsec CA 证书    : 可选。把 /root/ikev2-ca.crt 拷到手机导入后再选它"
+    echo "  IPsec CA 证书    : 可选。把 ${CA_EXPORT} 传到客户端导入后再选它"
     echo "                     可防服务器被冒充；不选也能连，只是不校验服务器身份"
   elif [[ "${MODE}" == "psk" ]]; then
     echo
@@ -722,7 +1129,7 @@ cmd_rotate_psk() {
 cmd_status() {
   load_state
   echo "── 服务 ─────────────────────────"
-  echo "  strongswan: $(systemctl is-active strongswan 2>/dev/null || echo down)"
+  echo "  ${SERVICE_NAME}: $(svc_is_active)"
   echo "── 已加载连接 ───────────────────"
   local conns
   conns="$(swanctl --list-conns 2>/dev/null | grep -E 'rw-(psk|eap)' || true)"
@@ -739,7 +1146,7 @@ cmd_status() {
   echo "  ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)  ipv6_forward=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)"
   (iptables -t nat -S POSTROUTING 2>/dev/null | grep -i masquerade || echo "  无 MASQUERADE") | sed 's/^/  /'
   echo "── 最近日志 ─────────────────────"
-  journalctl -u strongswan --since '10 min ago' --no-pager -n 12 2>/dev/null | sed 's/^/  /' || true
+  show_logs 12
 }
 
 cmd_mode() {
@@ -775,7 +1182,7 @@ cmd_diag() {
   load_state
   if [[ -z "${MODE:-}" ]]; then MODE="psk"; fi
   echo "── 服务 ─────────────────────────────"
-  echo "  strongswan: $(systemctl is-active strongswan 2>/dev/null || echo down)"
+  echo "  ${SERVICE_NAME}: $(svc_is_active)"
   echo "── 已加载连接 ───────────────────────"
   local conns
   conns="$(swanctl --list-conns 2>/dev/null | grep -E 'rw-(psk|eap)' || true)"
@@ -808,13 +1215,12 @@ cmd_diag() {
     echo "  有包但失败  = 看下面的日志关键字定位"
   else
     echo "  没装 tcpdump，手动跑:"
-    echo "    apt install -y tcpdump && tcpdump -ni any 'udp port 500 or udp port 4500'"
+    echo "    先安装 tcpdump 再执行：tcpdump -ni any 'udp port 500 or udp port 4500'"
   fi
   echo "── 最近 5 分钟错误 ──────────────────"
-  journalctl -u strongswan --since '5 min ago' --no-pager 2>/dev/null \
-    | grep -iE 'error|fail|no matching|constraint|authentication|proposal|IDr|IDi' \
-    | tail -15 | sed 's/^/  /' || true
-  echo "  完整日志: journalctl -u strongswan -f"
+  show_logs 200 | grep -iE 'error|fail|no matching|constraint|authentication|proposal|IDr|IDi' \
+    | tail -15 || true
+  echo "  完整日志: bash $0 diag 或直接查看服务日志"
 }
 
 cmd_uninstall() {
@@ -824,7 +1230,7 @@ cmd_uninstall() {
     # shellcheck disable=SC1090
     source "${STATE_FILE}"
   fi
-  systemctl stop strongswan >/dev/null 2>&1 || true
+  svc_stop
   rm -f "${CONF_FILE}" "${PSK_FILE}" "${EAP_FILE}" /etc/sysctl.d/99-ikev2-vpn.conf
   rm -rf /etc/ikev2-vpn
   sysctl --system >/dev/null 2>&1 || true
@@ -835,7 +1241,8 @@ usage() {
   cat <<EOF
 用法: bash $0 <命令> [参数]
   install [--auto]        安装 / 重装备（默认交互式问配置，--auto 全程用默认值）
-  client                  打印安卓手机填表参数
+  selftest                环境自检：识别发行版 / 依赖 / 容器检测，不做任何修改
+  client                  打印客户端填表参数
   status                  体检：服务 / 连接 / 在线客户端 / 端口 / 转发 / NAT / 日志
   useradd <用户名> <密码>  添加 EAP 用户
   userdel <用户名>         删除 EAP 用户
@@ -844,11 +1251,14 @@ usage() {
   mode psk|eap            切换接入模式（同一地址只能生效一种）
   diag                    连不上时的诊断：体检 + 抓包 25 秒 + 错误日志
   uninstall               清除配置
+
+支持发行版: debian / rhel / arch / opensuse / alpine
 EOF
 }
 
 case "${1:-}" in
   install)    shift; cmd_install "$@" ;;
+  selftest)   cmd_selftest ;;
   client)     cmd_client ;;
   status)     cmd_status ;;
   useradd)    shift; cmd_useradd "$@" ;;

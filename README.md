@@ -1,50 +1,88 @@
-# IKEv2/IPsec VPN 服务端（Debian）
+# IKEv2/IPsec VPN 服务端（Linux）
 
-用单个 bash 脚本把 Debian 部署成安卓原生客户端可连接的 IKEv2/IPsec VPN 服务端。支持 PSK 与 EAP-MSCHAPv2 两种接入方式，可随时切换，IPv4/IPv6 双栈全流量隧道。
+用单个 bash 脚本把 Linux 部署成安卓原生客户端可连接的 IKEv2/IPsec VPN 服务端。支持 PSK 与 EAP-MSCHAPv2 两种接入方式，可随时切换，IPv4/IPv6 双栈全流量隧道。
 
-- 服务端：strongSwan（swanctl），Debian 官方源
+- 服务端：strongSwan（swanctl），各发行版官方源
 - 客户端：Android 11 及以上系统自带 VPN，无需安装 App
 - 产物：`ikev2.sh` 单文件，幂等，可重复执行
 
 ## 目录
 
 - [0. 快速上手](#0-快速上手)
-- [1. 前置条件](#1-前置条件)
-- [2. 部署](#2-部署)
-- [3. 交互式安装](#3-交互式安装)
-- [4. 客户端配置](#4-客户端配置)
-- [5. 运维命令](#5-运维命令)
-- [6. 排障](#6-排障)
-- [7. 实现说明](#7-实现说明)
-- [8. 安全](#8-安全)
-- [9. 已知限制](#9-已知限制)
-- [10. License](#10-license)
+- [1. 支持的系统](#1-支持的系统)
+- [2. 前置条件](#2-前置条件)
+- [3. 部署](#3-部署)
+- [4. 交互式安装](#4-交互式安装)
+- [5. 客户端配置](#5-客户端配置)
+- [6. 运维命令](#6-运维命令)
+- [7. 排障](#7-排障)
+- [8. 实现说明](#8-实现说明)
+- [9. 安全](#9-安全)
+- [10. 已知限制](#10-已知限制)
+- [11. License](#11-license)
 
 ## 0. 快速上手
 
 ```
-① 上传 ikev2.sh 到 Debian 的 /root/
-② sed -i 's/\r$//' ikev2.sh      # Windows 传的必须修换行符
-③ bash ikev2.sh install          # 一路回车
-④ 放通 UDP 500 与 4500 到本机
-⑤ 按脚本打印的参数配置手机
+① 上传 ikev2.sh 到目标机的 /root/
+② bash ikev2.sh selftest     # 先自检，确认发行版识别正确
+③ sed -i 's/\r$//' ikev2.sh  # Windows 传的必须修换行符
+④ bash ikev2.sh install      # 一路回车
+⑤ 放通 UDP 500 与 4500 到本机
+⑥ 按脚本打印的参数配置手机
 ```
 
-## 1. 前置条件
+## 1. 支持的系统
+
+脚本读取 `/etc/os-release` 自动识别，覆盖以下五类：
+
+| 类别 | 包含的发行版 | 包管理器 | 配置目录 | 服务管理 | 防火墙 |
+|---|---|---|---|---|---|
+| `debian` | Debian、Ubuntu、Linux Mint、Proxmox、树莓派 OS | apt | `/etc/swanctl` | systemd | iptables |
+| `rhel` | RHEL、CentOS Stream、Rocky、AlmaLinux、Fedora、Oracle Linux | dnf | `/etc/strongswan/swanctl` | systemd | firewalld + iptables |
+| `arch` | Arch Linux、Manjaro、EndeavourOS | pacman | `/etc/swanctl` | systemd | iptables |
+| `opensuse` | openSUSE Leap、openSUSE Tumbleweed、SLE | zypper | `/etc/swanctl` | systemd | iptables |
+| `alpine` | Alpine Linux | apk | `/etc/swanctl` | OpenRC | iptables |
+
+几点差异说明：
+
+- **RHEL 系的配置目录不同**，是 `/etc/strongswan/swanctl/`，其余四类都是 `/etc/swanctl/`。这是编译期决定的，脚本会按发行版自动选择。
+- **RHEL 系需要 EPEL 仓库**。strongSwan 不在 RHEL 官方源中，脚本会尝试自动引导，引导失败时会给出手动命令。
+- **Alpine 需要 community 仓库**。脚本会检查并在缺失时追加到 `/etc/apk/repositories`。
+- **Alpine 使用 OpenRC**，服务管理命令是 `rc-service` 与 `rc-update`，脚本已适配。
+
+容器环境（Docker、LXC、containerd）会被检测并拒绝，IPsec 依赖内核 XFRM 模块，容器内无法正常工作。
+
+不在上表中的发行版（如 Gentoo、Slackware、NixOS）会被明确拒绝并提示。此时可在脚本头部手动设置 `DISTRO=debian` 强制走 apt 分支，前提是系统里有可用的 apt 与 strongSwan。
+
+### 1.1 先自检
+
+在目标机上执行：
+
+```bash
+bash ikev2.sh selftest
+```
+
+只读检查，不修改任何内容，输出七个板块：运行环境、发行版识别、内核 IPsec 能力、依赖工具、软件源、端口占用、已有配置。
+
+**这一步不能省**。发行版识别错了，后面装包、写配置都会失败，而报错信息往往不直观。先看自检输出确认识别结果正确，再执行 install。
+
+## 2. 前置条件
 
 | 项 | 要求 | 备注 |
 |---|---|---|
-| 操作系统 | Debian / Ubuntu 系 | 其他发行版需自行替换包名与服务名 |
+| 操作系统 | 见 [§1 支持的系统](#1-支持的系统) | |
 | 权限 | root | 脚本开头会检查，非 root 直接退出 |
-| 网络 | 能出公网，UDP 500 与 4500 需从外部可达 | NAT 后需端口转发，见 [§7.1](#71-端口必须放通) |
-| 客户端 | Android 11 及以上 | iOS / Windows / macOS / Linux 亦可连接，见 [§4.3](#43-其他平台) |
+| 网络 | 能出公网，UDP 500 与 4500 需从外部可达 | NAT 后需端口转发，见 [§8.1](#81-端口必须放通) |
+| 软件源 | 可用。RHEL 系需能访问 dl.fedoraproject.org | 内网离线环境需自备源 |
+| 客户端 | Android 11 及以上 | iOS / Windows / macOS / Linux 亦可连接 |
 | 磁盘 | 约 50 MB | strongSwan 与 OpenSSL 占用 |
 
 IPv6 隧道为可选项。脚本会探测本机是否具备 IPv6 出网能力，不具备时自动关闭该项。
 
-## 2. 部署
+## 3. 部署
 
-### 2.1 上传到服务器
+### 3.1 上传到服务器
 
 | 方式 | 操作 |
 |---|---|
@@ -53,7 +91,7 @@ IPv6 隧道为可选项。脚本会探测本机是否具备 IPv6 出网能力，
 | 克隆本仓库 | `git clone <本仓库地址> && cd ikev2-vpn` |
 | 没有传输工具 | 服务器上 `cat > /root/ikev2.sh`，粘贴后按 `Ctrl+D` |
 
-### 2.2 执行
+### 3.2 执行
 
 ```bash
 sudo -i                     # 必须 root
@@ -74,7 +112,7 @@ bash ikev2.sh client        # 随时重看填表参数
 - 最小化系统若未安装 curl，脚本会自动补装（探测公网 IP 需要）。装不上也能继续，只是探测结果会退化为网卡地址，此时手动填写公网地址。
 - 脚本是幂等的，改动配置后重跑 `install` 即可。防火墙规则采用先查后加，不会重复堆积；已有的 PSK 密钥默认沿用，手机上已填的旧密钥不会因此失效。
 
-## 3. 交互式安装
+## 4. 交互式安装
 
 `bash ikev2.sh install` 会逐项询问，**每项都带探测出来的默认值和推荐理由，直接回车即采用**：
 
@@ -135,7 +173,7 @@ bash ikev2.sh client        # 随时重看填表参数
 | 公网 IP / 域名 | 依次用 ip.3322.net、myip.ipip.net、myip.aliyun.com 探测，国内服务优先，境外仅作兜底。若探测到 192.168.x、10.x、172.16-31.x、100.64-127.x 这类内网地址，会提示本机位于 NAT 后，此时需要手动填写路由器 WAN 口公网 IP 或 DDNS 域名 |
 | IPv6 隧道 | 本机没有 IPv6 默认路由时默认值自动为 no，此时选 yes 无效 |
 | 地址池 | 与现有路由网段重叠时会告警并要求更换 |
-| 接入模式 | psk 为共享密钥，eap 为账号密码。同一地址只能生效一种，原因见 [§7.2](#72-psk-与-eap-只能二选一) |
+| 接入模式 | psk 为共享密钥，eap 为账号密码。同一地址只能生效一种，原因见 [§8.2](#82-psk-与-eap-只能二选一) |
 | PSK 标识符 | 可自定义，默认 android。客户端 PSK 模式必须原样填写，填错直接认证失败 |
 | PSK 密钥 | 默认随机生成 32 字节十六进制。也可自行指定（选 y），建议不少于 24 位 |
 | EAP 密码 | 隐藏输入并校验两次，不允许空格、冒号、引号与反斜杠 |
@@ -152,9 +190,9 @@ INSTALL_AUTO=yes bash ikev2.sh install   # 等价写法
 
 `--auto` 适用于 cloud-init 与批量部署场景。此时若脚本头部变量区已填值则使用该值，否则使用探测值。手动修改脚本头部变量区始终有效，这些值会成为交互提问时的默认值。
 
-## 4. 客户端配置
+## 5. 客户端配置
 
-### 4.1 Android
+### 5.1 Android
 
 设置 → 网络与互联网 → VPN → 右上角 `+`
 
@@ -175,11 +213,11 @@ INSTALL_AUTO=yes bash ikev2.sh install   # 等价写法
 | 服务器地址 | `vpn.example.com` |
 | IPsec 标识符 | 客户端 ID，如 `alice` |
 | 用户名 / 密码 | 由 `useradd` 创建的账号 |
-| IPsec CA 证书 | 可选，见 4.2 |
+| IPsec CA 证书 | 可选，见 5.2 |
 
 > **关于"IPsec 标识符"**：这是**客户端自己的身份（IDi）**，不是服务端身份。安卓的原生界面把它放在这个标签下，容易误解。服务端身份由安卓强制取"服务器地址"作为 IDr 并校验，所以这一栏填错会导致认证失败。
 
-### 4.2 导入 CA 证书
+### 5.2 导入 CA 证书
 
 服务端使用自签 CA。将 `/root/ikev2-ca.crt` 传到设备后导入：
 
@@ -188,7 +226,7 @@ INSTALL_AUTO=yes bash ikev2.sh install   # 等价写法
 
 导入后客户端可以验证服务器身份，避免被冒充。不导入也能建立连接，只是不做校验。PSK 模式下建议导入。
 
-### 4.3 其他平台
+### 5.3 其他平台
 
 服务端是标准 strongSwan 配置，不限于安卓：
 
@@ -200,11 +238,12 @@ INSTALL_AUTO=yes bash ikev2.sh install   # 等价写法
 | Linux | strongSwan 官方 App 或 NetworkManager | |
 | 路由器 / 软路由 | 视设备而定 | 部分设备不支持 EAP，或不支持自定义 PSK 的 IDi |
 
-各平台在"服务端标识 / Remote ID"一栏都应填写服务器地址，原因见 [§7.2](#72-psk-与-eap-只能二选一)。
+各平台在"服务端标识 / Remote ID"一栏都应填写服务器地址，原因见 [§8.2](#82-psk-与-eap-只能二选一)。
 
-## 5. 运维命令
+## 6. 运维命令
 
 ```bash
+bash ikev2.sh selftest                 # 环境自检：只读，不修改系统
 bash ikev2.sh install                 # 安装 / 重装备（默认交互式，--auto 免提问）
 bash ikev2.sh status                  # 体检：服务 / 连接 / 在线客户端 / 端口 / 转发 / NAT / 日志
 bash ikev2.sh client                  # 重新打印客户端填表参数
@@ -231,9 +270,9 @@ swanctl --list-sas         # 当前活跃的 SA
 ip pool show               # 地址池分配情况
 ```
 
-## 6. 排障
+## 7. 排障
 
-### 6.1 一键诊断
+### 7.1 一键诊断
 
 ```bash
 bash ikev2.sh diag
@@ -249,7 +288,7 @@ bash ikev2.sh diag
 | 有数据包，仅停留在 UDP 500 阶段 | 停留在 NAT-T 切换 | 检查 UDP 4500 转发 |
 | 有数据包但认证失败 | 身份或密钥不匹配 | 参见下方排障表 |
 
-### 6.2 排障表
+### 7.2 排障表
 
 | 现象 / 日志关键字 | 原因 | 处理 |
 |---|---|---|
@@ -265,17 +304,17 @@ bash ikev2.sh diag
 | 第二台设备连上后第一台掉线 | `unique` 设置问题 | 脚本已设 `unique = never`，若手改过配置请改回 |
 | 证书校验失败 | 服务器地址变了（动态 IP） | 换 DDNS 域名，或删掉 `server.crt` 后重跑 `install` 重签 |
 
-### 6.3 手工抓包
+### 7.3 手工抓包
 
 ```bash
 tcpdump -ni any 'udp port 500 or udp port 4500 or proto 50'
 ```
 
-## 7. 实现说明
+## 8. 实现说明
 
 本节记录脚本中若干看起来不合常规的处理及其原因。
 
-### 7.1 端口必须放通
+### 8.1 端口必须放通
 
 | 端口 | 用途 | 要求 |
 |---|---|---|
@@ -287,7 +326,7 @@ tcpdump -ni any 'udp port 500 or udp port 4500 or proto 50'
 
 > 动态公网 IP 建议使用 DDNS 域名。服务端身份的 IDr 与客户端填写的服务器地址都基于该值，IP 变化后未同步会表现为身份不匹配或证书校验失败。
 
-### 7.2 PSK 与 EAP 只能二选一
+### 8.2 PSK 与 EAP 只能二选一
 
 安卓原生客户端的身份处理是硬编码的（AOSP `VpnIkev2Utils.java`）：
 
@@ -316,7 +355,7 @@ bash ikev2.sh mode eap      # 切换到账号密码模式
 bash ikev2.sh mode psk      # 切回共享密钥模式，会重新生成密钥
 ```
 
-### 7.3 PSK 模式下有两条连接
+### 8.3 PSK 模式下有两条连接
 
 脚本在 PSK 模式下会生成两条连接：
 
@@ -327,13 +366,13 @@ bash ikev2.sh mode psk      # 切回共享密钥模式，会重新生成密钥
 
 日志中出现 `switching to connection 'rw-psk-any'` 属正常现象。两条连接使用同一把密钥与同一组地址池，安全性一致。
 
-### 7.4 IPv6 双栈为自动开关
+### 8.4 IPv6 双栈为自动开关
 
 脚本会检测本机是否存在 IPv6 默认路由。存在时下发 IPv6 虚拟地址与 IPv6 DNS，`local_ts` 包含 `::/0`，IPv6 流量同样经过隧道并做 MASQUERADE。不存在时自动关闭 IPv6 隧道，避免客户端的 IPv6 流量被送入黑洞。
 
 前提是 Debian 机器本身拥有全局 IPv6 且能出网。路由器侧的 IPv6 防火墙同样需要放行 UDP 500 与 4500。
 
-### 7.5 为什么装了两个 mangle 规则
+### 8.5 为什么装了两个 mangle 规则
 
 | 规则 | 作用 |
 |---|---|
@@ -342,9 +381,9 @@ bash ikev2.sh mode psk      # 切回共享密钥模式，会重新生成密钥
 
 MSS clamp 限定了来源地址，不会影响服务器上其他转发流量。
 
-## 8. 安全
+## 9. 安全
 
-### 8.1 密钥与凭据位置
+### 9.1 密钥与凭据位置
 
 | 内容 | 路径 | 权限 |
 |---|---|---|
@@ -357,13 +396,13 @@ MSS clamp 限定了来源地址，不会影响服务器上其他转发流量。
 
 EAP 用户密码以明文存储，这是 strongSwan 的 `eap-mschapv2` 机制决定的，因此该文件权限必须为 600。
 
-### 8.2 三个需要注意的限制
+### 9.2 三个需要注意的限制
 
 1. PSK 模式下没有服务器身份验证。客户端先发送认证载荷，之后才验证服务端，掌握密钥的一方可以冒充服务器，弱密钥还可能被离线爆破。缓解方式是使用脚本生成的 32 字节随机密钥，不要替换为便于记忆的字符串，并导入 CA 证书。
 2. PSK 模式无法按人吊销。多台设备共用一把密钥，需要让某台设备失效只能执行 `rotate-psk` 更换全部密钥。需要按人管理时使用 EAP 模式配合 `userdel`。
 3. 自签 CA 私钥泄露后，服务端可被完全冒充。`/etc/swanctl/private/ca.key` 不应外传，也不应提交到版本库。
 
-### 8.3 证书有效期
+### 9.3 证书有效期
 
 服务端证书有效期为 825 天，iOS 会拒绝有效期更长的证书。到期前重新签发：
 
@@ -372,27 +411,30 @@ rm /etc/swanctl/certs/server.crt
 bash ikev2.sh install
 ```
 
-### 8.4 报告安全问题
+### 9.4 报告安全问题
 
 请勿提交公开 Issue，见 [SECURITY.md](SECURITY.md)。
 
-## 9. 已知限制
+## 10. 已知限制
 
-- 仅支持 Debian 与 Ubuntu 系，其他发行版需自行替换包名、服务名与防火墙后端。
+- 仅支持 [§1 列出的五类发行版](#1-支持的系统)。Gentoo、Slackware、NixOS 等会被拒绝，可用脚本头部的 `DISTRO=` 强制指定，但需自行确认包名与服务名一致。
+- RHEL 系安装 strongSwan 必须有 EPEL 仓库，且需要能访问 dl.fedoraproject.org。离线内网环境需自备源。
+- 容器环境（Docker、LXC、containerd）会被拒绝。IPsec 依赖内核 XFRM 模块，容器内无法工作。
 - PSK 与 EAP 不能同时生效，原因是安卓将服务端身份固定为服务器地址，服务端无法区分认证方式。可通过 `mode` 切换。
 - PSK 模式下一把密钥由多台设备共用。需要按设备或按人管理时使用 EAP 模式。
 - IPv6 隧道依赖服务器自身的 IPv6 出网能力，脚本只做探测与开关，不负责申请 IPv6 地址。
+- 防火墙规则持久化在各发行版上的机制不同，Arch 与 openSUSE 未做自动持久化，重启后需自行处理。
 - `uninstall` 不卸载 strongSwan 软件包，也不回滚防火墙规则，以免删除用户已有的规则，需要时手动清理。
 - 脚本不备份用户数据，重跑 `install` 会覆盖配置文件。
 
-## 10. License
+## 11. License
 
 [MIT](LICENSE) © ikev2-vpn contributors
 
 ## 致谢
 
 - [strongSwan](https://www.strongswan.org/)，实际的 IKE 与 IPsec 实现
-- 项目中遇到的多数问题已整理在 [§6 排障](#6-排障) 与 [§7 实现说明](#7-实现说明)，欢迎补充 Issue
+- 项目中遇到的多数问题已整理在 [§7 排障](#7-排障) 与 [§8 实现说明](#8-实现说明)，欢迎补充 Issue
 
 
 

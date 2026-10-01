@@ -113,16 +113,19 @@ distro_label() {
 }
 
 # 容器内缺少内核 XFRM 模块与 NET_ADMIN 能力，IPsec 无法真正工作
+# 仅拒绝容器环境（Docker/LXC/podman 等）。注意：必须是 "容器" 而非 "虚拟机"。
+# systemd-detect-virt 默认模式会把虚拟机（kvm/hyper-v/vmware 等）也算进来，
+# 而虚机有完整内核 XFRM，完全能跑 IPsec —— 所以这里用 --container 只看容器。
 check_not_container() {
   local virt=""
   if command -v systemd-detect-virt >/dev/null 2>&1; then
-    virt="$(systemd-detect-virt 2>/dev/null || true)"
+    virt="$(systemd-detect-virt --container 2>/dev/null || true)"
   fi
   if [[ -n "${virt}" && "${virt}" != "none" ]]; then
-    die "检测到容器环境（${virt}）。IPsec 依赖内核 XFRM 模块与 NET_ADMIN 能力，容器内无法正常工作。请在宿主机或云主机上部署。"
+    die "检测到容器环境（${virt}）。IPsec 依赖内核 XFRM 模块与 NET_ADMIN 能力，容器内无法正常工作。请在宿主机或虚机上部署。"
   fi
   if [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|kubepods|containerd)' /proc/1/cgroup 2>/dev/null; then
-    die "检测到容器环境。IPsec 依赖内核 XFRM 模块，容器内无法正常工作。请在宿主机或云主机上部署。"
+    die "检测到容器环境。IPsec 依赖内核 XFRM 模块，容器内无法正常工作。请在宿主机或虚机上部署。"
   fi
 }
 
@@ -925,7 +928,9 @@ cmd_selftest() {
         echo "  strongSwan: 当前源中不可见，install 会自动追加 community 仓库"
       fi ;;
     debian)
-      if apt-cache policy strongswan 2>/dev/null | grep -q 'Candidate: [^(]'; then
+      # 兼容中文/英文 locale + 行首缩进：候选行形如 "  Candidate: 1.0" 或 "  候选： 1.0"
+      # 候选版本非 (none) 即视为源中可见
+      if apt-cache policy strongswan 2>/dev/null | grep -E '(Candidate|候选)：? *[0-9]' | grep -qv '(none)'; then
         echo "  strongSwan: 源中可见"
       else
         echo "  strongSwan: 当前源中不可见，请检查 apt 源配置"

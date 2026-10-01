@@ -940,14 +940,21 @@ cmd_selftest() {
 
   # 7 现有安装状态
   echo "── 7. 已有配置 ─────────────────────"
-  if [[ -r "${STATE_FILE}" ]]; then
-    echo "  已安装过，状态文件 ${STATE_FILE}"
-    # shellcheck disable=SC1090
-    ( source "${STATE_FILE}" 2>/dev/null && echo "  当前模式=${MODE:-?}  服务器地址=${VPN_HOST:-?}  地址池=${POOL4:-?}" ) || true
-    if [[ "${INIT_KIND}" == "systemd" ]]; then
-      echo "  服务状态: $(svc_is_active)"
+  if [[ -e "${STATE_FILE}" ]]; then
+    if [[ ! -r "${STATE_FILE}" ]]; then
+      # 文件在但读不了，多半是非 root 运行
+      echo "  状态文件存在但当前用户无读取权限: ${STATE_FILE}"
+      echo "  以 root 重新执行可看到已安装的详细配置: sudo bash $0 selftest"
     else
-      echo "  服务状态: $(rc-service "${SERVICE_NAME}" status >/dev/null 2>&1 && echo active || echo inactive)"
+      echo "  已安装过，状态文件 ${STATE_FILE}"
+      # shellcheck disable=SC1090
+      ( set +u; source "${STATE_FILE}" >/dev/null 2>&1 || true
+        echo "  当前模式=${MODE:-未记录}  服务器地址=${VPN_HOST:-未记录}  地址池=${POOL4:-未记录}" )
+      if [[ "${INIT_KIND}" == "systemd" ]]; then
+        echo "  服务状态: $(svc_is_active)"
+      else
+        echo "  服务状态: $(rc-service "${SERVICE_NAME}" status >/dev/null 2>&1 && echo active || echo inactive)"
+      fi
     fi
   else
     echo "  尚未安装（无 ${STATE_FILE}）"
@@ -1166,6 +1173,7 @@ cmd_mode() {
     local psk
     psk="$(gen_psk)"
     info "已切到 PSK 模式，密钥: ${psk}"
+    warn "本次切换重新生成了密钥，与之前不同。若此前有客户端在用旧密钥，需重新填写"
   else
     rm -f "${PSK_FILE}"
     gen_pki

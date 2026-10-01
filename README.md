@@ -67,6 +67,8 @@ bash ikev2.sh selftest
 
 **这一步不能省**。发行版识别错了，后面装包、写配置都会失败，而报错信息往往不直观。先看自检输出确认识别结果正确，再执行 install。
 
+`selftest` 本身不需要 root，可以普通用户执行。但第七板块会读取安装状态文件，该文件权限为 600，普通用户读不到时会提示改用 `sudo bash ikev2.sh selftest`。
+
 ## 2. 前置条件
 
 | 项 | 要求 | 备注 |
@@ -100,6 +102,7 @@ cd /root
 # Windows 传过去的文件可能带 CRLF 换行，先修一次（否则报 $'\r': command not found）
 sed -i 's/\r$//' ikev2.sh
 
+bash ikev2.sh selftest       # 先自检，确认发行版识别正确
 bash ikev2.sh install       # 交互式，一路回车；装完自动打印客户端填表参数
 bash ikev2.sh status        # 体检
 bash ikev2.sh client        # 随时重看填表参数
@@ -219,12 +222,19 @@ INSTALL_AUTO=yes bash ikev2.sh install   # 等价写法
 
 ### 5.2 导入 CA 证书
 
-服务端使用自签 CA。将 `/root/ikev2-ca.crt` 传到设备后导入：
+服务端使用自签 CA。安装完成后证书位于 `/root/ikev2-ca.crt`，取出后传到设备：
 
-- Android：设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书，选中该文件
+```bash
+# 传到当前目录的 ca.crt，便于后续拷贝
+cp /root/ikev2-ca.crt ~/ca.crt
+```
+
+- Android：把 `ca.crt` 传到手机，设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书，选中该文件
 - iOS：用 AirDrop 或邮件发送到本机，设置 → 通用 → VPN 与设备管理，安装描述文件，之后在 VPN 设置中选择该配置
 
 导入后客户端可以验证服务器身份，避免被冒充。不导入也能建立连接，只是不做校验。PSK 模式下建议导入。
+
+该文件权限为 644 但位于 `/root/` 下，只有 root 能读取，因此需要用 `sudo cp` 导出。
 
 ### 5.3 其他平台
 
@@ -259,7 +269,11 @@ bash ikev2.sh uninstall               # 清除配置
 实时看连接日志：
 
 ```bash
+# systemd 系（debian / rhel / arch / opensuse）
 journalctl -u strongswan -f
+
+# Alpine（OpenRC）
+rc-service strongswan --nodaemon
 ```
 
 在线客户端与 SA 状态：
@@ -322,7 +336,7 @@ tcpdump -ni any 'udp port 500 or udp port 4500 or proto 50'
 | UDP 4500 | NAT-T（封装后的 ESP） | 必须 |
 | IP 协议 50（ESP） | 非 NAT 直连时的加密流量 | 建议 |
 
-云主机需在安全组放行 UDP 500 与 4500。NAT 场景（家宽、内网部署）需在路由器将这两个端口转发到 Debian 的内网 IP。交互安装第 [1] 问需填写客户端能连到的公网 IP 或 DDNS 域名，脚本探测到的是出网 IP，在 NAT 场景下通常无法直连。
+云主机需在安全组放行 UDP 500 与 4500。NAT 场景（家宽、内网部署）需在路由器将这两个端口转发到运行 strongSwan 那台机器的内网 IP。交互安装第 [1] 问需填写客户端能连到的公网 IP 或 DDNS 域名，脚本探测到的是出网 IP，在 NAT 场景下通常无法直连。
 
 > 动态公网 IP 建议使用 DDNS 域名。服务端身份的 IDr 与客户端填写的服务器地址都基于该值，IP 变化后未同步会表现为身份不匹配或证书校验失败。
 
@@ -352,8 +366,10 @@ remoteId = parseIkeIdentification(profile.getServerAddr());   // 服务端身份
 
 ```bash
 bash ikev2.sh mode eap      # 切换到账号密码模式
-bash ikev2.sh mode psk      # 切回共享密钥模式，会重新生成密钥
+bash ikev2.sh mode psk      # 切回共享密钥模式
 ```
+
+切到 psk 时脚本会重新生成一把随机密钥。若此前已有客户端用旧密钥连接，切换后需要重新填写。切到 eap 不影响已有 EAP 账号。
 
 ### 8.3 PSK 模式下有两条连接
 
@@ -370,7 +386,7 @@ bash ikev2.sh mode psk      # 切回共享密钥模式，会重新生成密钥
 
 脚本会检测本机是否存在 IPv6 默认路由。存在时下发 IPv6 虚拟地址与 IPv6 DNS，`local_ts` 包含 `::/0`，IPv6 流量同样经过隧道并做 MASQUERADE。不存在时自动关闭 IPv6 隧道，避免客户端的 IPv6 流量被送入黑洞。
 
-前提是 Debian 机器本身拥有全局 IPv6 且能出网。路由器侧的 IPv6 防火墙同样需要放行 UDP 500 与 4500。
+前提是运行 strongSwan 的机器本身拥有全局 IPv6 且能出网。路由器侧的 IPv6 防火墙同样需要放行 UDP 500 与 4500。
 
 ### 8.5 为什么装了两个 mangle 规则
 
@@ -385,10 +401,12 @@ MSS clamp 限定了来源地址，不会影响服务器上其他转发流量。
 
 ### 9.1 密钥与凭据位置
 
+下表路径以 debian / arch / opensuse / alpine 为例。RHEL 系的前四项位于 `/etc/strongswan/swanctl/` 下，其余不变。实际路径以 `bash ikev2.sh selftest` 输出的配置目录为准。
+
 | 内容 | 路径 | 权限 |
 |---|---|---|
 | PSK 共享密钥 | `/etc/swanctl/conf.d/ikev2-psk.conf` | 600 |
-| 服务端证书与私钥 | `/etc/swanctl/{certs,private}/` | 600 |
+| 服务端证书与私钥 | `/etc/swanctl/{x509,private}/` | 600 |
 | 自签 CA 证书，需传给客户端 | `/root/ikev2-ca.crt` | 644 |
 | 自签 CA 私钥 | `/etc/swanctl/private/ca.key` | 600，不应外传 |
 | EAP 用户表，明文 | `/etc/ikev2-vpn/users.list` | 600 |
@@ -404,10 +422,15 @@ EAP 用户密码以明文存储，这是 strongSwan 的 `eap-mschapv2` 机制决
 
 ### 9.3 证书有效期
 
-服务端证书有效期为 825 天，iOS 会拒绝有效期更长的证书。到期前重新签发：
+服务端证书有效期为 825 天，iOS 会拒绝有效期更长的证书。到期前重新签发，路径中的配置目录请按实际发行版调整：
 
 ```bash
-rm /etc/swanctl/certs/server.crt
+# debian / arch / opensuse / alpine
+rm /etc/swanctl/x509/server.crt
+
+# rhel 系
+rm /etc/strongswan/swanctl/x509/server.crt
+
 bash ikev2.sh install
 ```
 
@@ -435,8 +458,3 @@ bash ikev2.sh install
 
 - [strongSwan](https://www.strongswan.org/)，实际的 IKE 与 IPsec 实现
 - 项目中遇到的多数问题已整理在 [§7 排障](#7-排障) 与 [§8 实现说明](#8-实现说明)，欢迎补充 Issue
-
-
-
-
-

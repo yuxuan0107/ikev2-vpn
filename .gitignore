@@ -1,0 +1,4 @@
+.workbuddy/
+*.log
+*.bak
+*.bak.*

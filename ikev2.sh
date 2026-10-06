@@ -827,6 +827,44 @@ persist_firewall() {
 
 reload() { swanctl --load-all --noprompt >/dev/null 2>&1 || swanctl --load-all; }
 
+# ==================== 端口占用检测 ====================
+# UDP 500/4500 是 IKE 固定端口，同一 IP 上只能被一个进程独占。
+# 本机若已跑其他 VPN 服务（SoftEther / L2TP / racoon 等）占用这两个端口，
+# strongSwan 会启动失败或收不到包，属于必须先解决的冲突。
+port_occupants() {
+  ss -lunp 2>/dev/null | grep -E ':(500|4500)\b' || true
+}
+
+# 占用者里是否含 strongSwan（charon）。只有 strongSwan 自己占用才算正常。
+port_conflict_by_other() {
+  local out
+  out="$(port_occupants)"
+  [[ -n "${out}" ]] || return 1
+  if echo "${out}" | grep -qiE 'charon|strongswan'; then
+    return 1        # 只有 strongSwan 占用，不算冲突
+  fi
+  return 0          # 存在非 strongSwan 占用者
+}
+
+# 在 install 前提示端口冲突。返回 0 表示无需干预，1 表示检测到冲突占用者。
+check_port_available() {
+  command -v ss >/dev/null 2>&1 || return 0   # 没有 ss 就跳过检测
+  port_conflict_by_other || return 0
+  local out
+  out="$(port_occupants)"
+  warn "UDP 500/4500 已被本机其它进程占用："
+  printf '%s\n' "${out}" | head -4 | sed 's/^/    /'
+  echo
+  echo "    IKE 协议的 500/4500 是固定端口，同一 IP 上只能有一个进程监听。"
+  echo "    若占用者是 SoftEther / L2TP / racoon 等 VPN 服务，strongSwan"
+  echo "    将无法启动或收不到握手包，属硬冲突，需先二选一："
+  echo "      A. 关闭对方的 IPsec 功能后重试"
+  echo "         SoftEther: vpncmd 里执行 IPsecEnable /L2TP:no 后重启 vpnserver"
+  echo "      B. 改用其他端口的 IPsec 服务（客户端也需同步改端口）"
+  echo "    可先用 bash $0 selftest 查看占用详情"
+  return 1
+}
+
 # ==================== 环境自检 ====================
 # 只读检查，不做任何修改。用于在目标机器上验证发行版识别是否正确
 cmd_selftest() {
@@ -943,12 +981,19 @@ cmd_selftest() {
   # 6 端口占用
   echo "── 6. 端口占用 ─────────────────────"
   local busy
-  busy="$(ss -lunp 2>/dev/null | grep -E ':(500|4500)\b' || true)"
-  if [[ -n "${busy}" ]]; then
-    echo "  500/4500 已被占用，安装时会复用现有 strongSwan 进程："
-    printf '%s\n' "${busy}" | head -4 | sed 's/^/    /'
-  else
+  busy="$(port_occupants)"
+  if [[ -z "${busy}" ]]; then
     echo "  500/4500 空闲"
+  elif port_conflict_by_other; then
+    echo "  已被非 strongSwan 进程占用，与本脚本存在硬冲突："
+    printf '%s\n' "${busy}" | head -4 | sed 's/^/    /'
+    echo
+    echo "  IKE 的 500/4500 为固定端口，同一 IP 只能被一个进程监听。"
+    echo "  占用者若是 SoftEther / L2TP / racoon 等 VPN 服务，需先关闭其"
+    echo "  IPsec 功能，或改用其他端口，否则 strongSwan 无法正常工作。"
+  else
+    echo "  由 strongSwan 自身监听（正常）："
+    printf '%s\n' "${busy}" | head -4 | sed 's/^/    /'
   fi
   echo
 
@@ -1009,6 +1054,10 @@ cmd_install() {
   check_not_container
   detect_distro
   info "识别到发行版：$(distro_label)（包管理器 ${PKG_MGR}，配置目录 ${CONF_DIR}）"
+  # 端口冲突必须在装包前查，否则装完 strongSwan 起不来更难排查
+  if ! check_port_available; then
+    die "存在端口冲突，未做任何改动。请按上方提示处理后重新执行 install"
+  fi
   ensure_tools
   probe_env
   if [[ "${INSTALL_AUTO}" != "yes" ]]; then interactive_setup; fi

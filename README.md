@@ -176,7 +176,7 @@ bash ikev2.sh client        # 随时重看填表参数
 | 公网 IP / 域名 | 依次用 ip.3322.net、myip.ipip.net、myip.aliyun.com 探测，国内服务优先，境外仅作兜底。若探测到 192.168.x、10.x、172.16-31.x、100.64-127.x 这类内网地址，会提示本机位于 NAT 后，此时需要手动填写路由器 WAN 口公网 IP 或 DDNS 域名 |
 | IPv6 隧道 | 本机没有 IPv6 默认路由时默认值自动为 no，此时选 yes 无效 |
 | 地址池 | 与现有路由网段重叠时会告警并要求更换 |
-| 接入模式 | psk 为共享密钥，eap 为账号密码。同一地址只能生效一种，原因见 [§8.2](#82-psk-与-eap-只能二选一) |
+| 接入模式 | psk 为共享密钥，eap 为账号密码。同一地址只能生效一种，原因见 [§8.3](#83-psk-与-eap-只能二选一) |
 | PSK 标识符 | 可自定义，默认 android。客户端 PSK 模式必须原样填写，填错直接认证失败 |
 | PSK 密钥 | 默认随机生成 32 字节十六进制。也可自行指定（选 y），建议不少于 24 位 |
 | EAP 密码 | 隐藏输入并校验两次，不允许空格、冒号、引号与反斜杠 |
@@ -248,7 +248,7 @@ cp /root/ikev2-ca.crt ~/ca.crt
 | Linux | strongSwan 官方 App 或 NetworkManager | |
 | 路由器 / 软路由 | 视设备而定 | 部分设备不支持 EAP，或不支持自定义 PSK 的 IDi |
 
-各平台在"服务端标识 / Remote ID"一栏都应填写服务器地址，原因见 [§8.2](#82-psk-与-eap-只能二选一)。
+各平台在"服务端标识 / Remote ID"一栏都应填写服务器地址，原因见 [§8.3](#83-psk-与-eap-只能二选一)。
 
 ## 6. 运维命令
 
@@ -306,7 +306,7 @@ bash ikev2.sh diag
 
 | 现象 / 日志关键字 | 原因 | 处理 |
 |---|---|---|
-| 点连接立刻失败，服务端日志**完全没有包** | 端口没通 | 查路由器端口转发 / 云安全组 UDP 500+4500 |
+| 点连接立刻失败，服务端日志**完全没有包** | 端口没通，或被本机其他 VPN 服务占用 | 先用 `ss -lunp` 看 500/4500 占用者；若为 SoftEther 等，见 [§8.2 与已有 VPN 服务共存](#82-与已有-vpn-服务共存) |
 | `no proposal chosen` | 算法或 IKE 版本不匹配 | 确认选的是 **IKEv2** 开头的类型，不是 L2TP / IPsec Xauth |
 | `AUTHENTICATION_FAILED`、`no shared key found` | PSK 密钥不对 | 用 `client` 核对，注意别多粘空格 |
 | `constraint check failed: identity 'xxx' required` | 客户端 IDi 与服务端要求的不一致 | PSK 模式标识符需原样填写安装时设定的值，默认 `android` |
@@ -340,7 +340,37 @@ tcpdump -ni any 'udp port 500 or udp port 4500 or proto 50'
 
 > 动态公网 IP 建议使用 DDNS 域名。服务端身份的 IDr 与客户端填写的服务器地址都基于该值，IP 变化后未同步会表现为身份不匹配或证书校验失败。
 
-### 8.2 PSK 与 EAP 只能二选一
+### 8.2 与已有 VPN 服务共存
+
+UDP 500 与 4500 是 IKE 协议的固定端口，**同一 IP 上只能被一个进程监听**。如果目标机器上已运行其他 VPN 服务，是否冲突取决于对方是否启用了 IPsec 功能：
+
+| 已有服务 | 占用端口 | 是否冲突 |
+|---|---|---|
+| SoftEther 仅 SSL-VPN（默认 443） | 443/tcp | 不冲突 |
+| SoftEther + OpenVPN | 1194 | 不冲突 |
+| SoftEther + L2TP/IPsec | 500、4500/udp | 冲突 |
+| racoon / libreswan / 其他 IPsec | 500、4500/udp | 冲突 |
+| OpenVPN / WireGuard / ocserv | 1194 / 51820 / 443 | 不冲突 |
+
+SoftEther 的 IPsec 功能默认关闭，若未执行过 `IPsecEnable` 则不占用 500/4500。确认方法：
+
+```bash
+# 看端口被谁占用
+ss -lunp | grep -E ':(500|4500)\b'
+
+# 查 SoftEther 是否启用了 IPsec
+/usr/local/vpnserver/vpncmd localhost:5555 /SERVER /PASSWORD:管理密码
+# 进入后执行：IPsecGet
+```
+
+`install` 会在装包前自动检测，若发现非 strongSwan 进程占用这两个端口会中止并提示，不会留下装到一半的状态。`selftest` 的第 6 板块也会显示占用情况。
+
+确认冲突后需二选一：
+
+- 关闭对方的 IPsec 功能。SoftEther 在 vpncmd 中执行 `IPsecEnable /L2TP:no`，再重启 vpnserver
+- 改用其他端口的 IPsec 服务，客户端配置也需同步修改端口
+
+### 8.3 PSK 与 EAP 只能二选一
 
 安卓原生客户端的身份处理是硬编码的（AOSP `VpnIkev2Utils.java`）：
 
@@ -371,7 +401,7 @@ bash ikev2.sh mode psk      # 切回共享密钥模式
 
 切到 psk 时脚本会重新生成一把随机密钥。若此前已有客户端用旧密钥连接，切换后需要重新填写。切到 eap 不影响已有 EAP 账号。
 
-### 8.3 PSK 模式下有两条连接
+### 8.4 PSK 模式下有两条连接
 
 脚本在 PSK 模式下会生成两条连接：
 
@@ -382,13 +412,13 @@ bash ikev2.sh mode psk      # 切回共享密钥模式
 
 日志中出现 `switching to connection 'rw-psk-any'` 属正常现象。两条连接使用同一把密钥与同一组地址池，安全性一致。
 
-### 8.4 IPv6 双栈为自动开关
+### 8.5 IPv6 双栈为自动开关
 
 脚本会检测本机是否存在 IPv6 默认路由。存在时下发 IPv6 虚拟地址与 IPv6 DNS，`local_ts` 包含 `::/0`，IPv6 流量同样经过隧道并做 MASQUERADE。不存在时自动关闭 IPv6 隧道，避免客户端的 IPv6 流量被送入黑洞。
 
 前提是运行 strongSwan 的机器本身拥有全局 IPv6 且能出网。路由器侧的 IPv6 防火墙同样需要放行 UDP 500 与 4500。
 
-### 8.5 为什么装了两个 mangle 规则
+### 8.6 为什么装了两个 mangle 规则
 
 | 规则 | 作用 |
 |---|---|

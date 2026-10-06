@@ -25,12 +25,16 @@
 
 ```
 ① 上传 ikev2.sh 到目标机的 /root/
-② bash ikev2.sh selftest     # 先自检，确认发行版识别正确
-③ sed -i 's/\r$//' ikev2.sh  # Windows 传的必须修换行符
+② sed -i 's/\r$//' ikev2.sh  # Windows 传的必须修换行符
+③ bash ikev2.sh selftest     # 必做：确认发行版识别正确、500/4500 未被其他 VPN 占用
 ④ bash ikev2.sh install      # 一路回车
 ⑤ 放通 UDP 500 与 4500 到本机
 ⑥ 按脚本打印的参数配置手机
 ```
+
+第 ③ 步不能跳过。`install` 会在装包前检查端口占用，若本机已有 SoftEther 等 VPN 服务占用 UDP 500/4500 会直接中止。详见 [§8.2 与已有 VPN 服务共存](#82-与已有-vpn-服务共存)。
+
+需要还原时执行 `bash ikev2.sh uninstall`，但它不卸载软件包也不回滚防火墙规则，完整清理步骤见 [§10 已知限制](#10-已知限制)。
 
 ## 1. 支持的系统
 
@@ -76,6 +80,7 @@ bash ikev2.sh selftest
 | 操作系统 | 见 [§1 支持的系统](#1-支持的系统) | |
 | 权限 | root | 脚本开头会检查，非 root 直接退出 |
 | 网络 | 能出公网，UDP 500 与 4500 需从外部可达 | NAT 后需端口转发，见 [§8.1](#81-端口必须放通) |
+| 端口 | 本机 500/4500 未被其他 VPN 服务占用 | SoftEther 等启用 IPsec 时会冲突，见 [§8.2](#82-与已有-vpn-服务共存) |
 | 软件源 | 可用。RHEL 系需能访问 dl.fedoraproject.org | 内网离线环境需自备源 |
 | 客户端 | Android 11 及以上 | iOS / Windows / macOS / Linux 亦可连接 |
 | 磁盘 | 约 50 MB | strongSwan 与 OpenSSL 占用 |
@@ -114,6 +119,7 @@ bash ikev2.sh client        # 随时重看填表参数
 - 提示信息显示为乱码时，执行 `export LANG=C.UTF-8`。这只是显示问题。
 - 最小化系统若未安装 curl，脚本会自动补装（探测公网 IP 需要）。装不上也能继续，只是探测结果会退化为网卡地址，此时手动填写公网地址。
 - 脚本是幂等的，改动配置后重跑 `install` 即可。防火墙规则采用先查后加，不会重复堆积；已有的 PSK 密钥默认沿用，手机上已填的旧密钥不会因此失效。
+- `install` 会在装包前检查 UDP 500/4500 是否被本机其他 VPN 服务占用，检出冲突时直接中止，此时不会有任何改动。
 
 ## 4. 交互式安装
 
@@ -272,8 +278,8 @@ bash ikev2.sh uninstall               # 清除配置
 # systemd 系（debian / rhel / arch / opensuse）
 journalctl -u strongswan -f
 
-# Alpine（OpenRC）
-rc-service strongswan --nodaemon
+# Alpine（OpenRC，OpenRC 无 journalctl）
+logread -f | grep -i charon
 ```
 
 在线客户端与 SA 状态：
@@ -473,12 +479,23 @@ bash ikev2.sh install
 - 仅支持 [§1 列出的五类发行版](#1-支持的系统)。Gentoo、Slackware、NixOS 等会被拒绝，可用脚本头部的 `DISTRO=` 强制指定，但需自行确认包名与服务名一致。
 - RHEL 系安装 strongSwan 必须有 EPEL 仓库，且需要能访问 dl.fedoraproject.org。离线内网环境需自备源。
 - 容器环境（Docker、LXC、containerd）会被拒绝。IPsec 依赖内核 XFRM 模块，容器内无法工作。
+- UDP 500/4500 为 IKE 固定端口，本机若已有其他 IPsec 服务（SoftEther 的 L2TP/IPsec、racoon、libreswan 等）会冲突，`install` 会检测并中止，见 [§8.2](#82-与已有-vpn-服务共存)。
 - PSK 与 EAP 不能同时生效，原因是安卓将服务端身份固定为服务器地址，服务端无法区分认证方式。可通过 `mode` 切换。
 - PSK 模式下一把密钥由多台设备共用。需要按设备或按人管理时使用 EAP 模式。
 - IPv6 隧道依赖服务器自身的 IPv6 出网能力，脚本只做探测与开关，不负责申请 IPv6 地址。
 - 防火墙规则持久化在各发行版上的机制不同，Arch 与 openSUSE 未做自动持久化，重启后需自行处理。
 - `uninstall` 不卸载 strongSwan 软件包，也不回滚防火墙规则，以免删除用户已有的规则，需要时手动清理。
 - 脚本不备份用户数据，重跑 `install` 会覆盖配置文件。
+
+完全还原需手动执行以下步骤：
+
+```bash
+bash ikev2.sh uninstall                      # 停服务、清配置与证书
+apt purge strongswan charon-systemd strongswan-pki strongswan-swanctl \
+                libstrongswan libcharon-extra-plugins      # Debian 系示例
+sysctl -w net.ipv4.ip_forward=0             # 恢复内核转发
+# 防火墙规则需按 [§8.1](#81-端口必须放通) 与 mangle 规则逐条删除
+```
 
 ## 11. License
 
